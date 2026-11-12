@@ -123,18 +123,26 @@ function cleanInv(d){
   return {stock, spare};
 }
 
-/* ---- Участники команды ---- */
-let unsubMembers=null, lastTouch=0;
+/* ---- Участники команды и доступ ---- */
+// Доступ: в команду входят по ссылке с ключом (?team=…&k=…). База пускает к данным только участников.
+// Админ может убрать человека — ключ тут же меняется, и по старой ссылке уже не войти.
+const CODE_RE=/^[a-z0-9]{16,40}$/;
+let unsubMembers=null, unsubTeam=null, lastTouch=0;
 function cleanMembers(list){
   return (list||[]).filter(m=>m && typeof m.id==='string' && /^[A-Za-z0-9]{10,64}$/.test(m.id))
     .map(m=>({id:m.id, me:!!m.me, name:str(m.name,40)||'Без имени', lastSeen:typeof m.lastSeen==='number'?m.lastSeen:0, joinedAt:typeof m.joinedAt==='number'?m.joinedAt:0}))
     .sort((a,b)=> (b.me-a.me) || (b.lastSeen-a.lastSeen));
 }
+function cleanTeamInfo(d){
+  if(!d) return null;
+  const admins=(Array.isArray(d.admins)?d.admins:[]).filter(x=>typeof x==='string' && /^[A-Za-z0-9]{10,64}$/.test(x)).slice(0,10);
+  return {admins, joinKey: CODE_RE.test(d.joinKey)?d.joinKey:null};
+}
+const isAdmin=()=> !!(S.teamInfo && S.uid && S.teamInfo.admins.includes(S.uid));
 function touchMember(force){
-  const be=S.backend; if(!be || !be.touchMember || !S.team || !S.name) return;
+  const be=S.backend; if(!be || !be.touchMember || !S.team || !S.name || S.access!=='ok') return;
   const now=Date.now(); if(!force && now-lastTouch<10*60*1000) return; lastTouch=now;
-  const firstKey='rider-joined-'+S.team; const first=!LS.get(firstKey,false);
-  Promise.resolve(be.touchMember(S.team, S.name, first)).then(()=>{ if(first) LS.set(firstKey,true); }).catch(e=>console.warn('member',e));
+  Promise.resolve(be.touchMember(S.team, S.name)).catch(e=>console.warn('member',e));
 }
 document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') touchMember(false); });
 function ago(t){
@@ -146,19 +154,47 @@ function ago(t){
 }
 
 let unsub=null;
-function connect(){
-  if(unsub){ try{unsub();}catch(e){} unsub=null; }
-  S.loaded=false; S.services=[]; S.inv={stock:{},spare:{xlr:2,jack:1}}; S.err=null; S.members=[];
-  const be=S.backend;
-  if(unsubMembers){ try{unsubMembers();}catch(e){} unsubMembers=null; }
-  if(be.subscribeMembers) unsubMembers=be.subscribeMembers(S.team, list=>{ S.members=cleanMembers(list); if(view.name==='team') softRender(); });
+function stopSubs(){
+  for(const f of [unsub, unsubMembers, unsubTeam]) if(f){ try{f();}catch(e){} }
+  unsub=unsubMembers=unsubTeam=null;
+}
+function isDenied(e){ return e && (e.code==='permission-denied' || e.code==='not-found'); }
+function lostAccess(){ stopSubs(); S.access='denied'; S.loaded=true; render(); }
+
+async function connect(){
+  stopSubs();
+  S.loaded=false; S.services=[]; S.inv={stock:{},spare:{xlr:2,jack:1}}; S.err=null; S.members=[]; S.teamInfo=null; S.stale=false;
+  const be=S.backend; const team=S.team;
+  S.access='checking'; render();
+  if(be.ensureMember){
+    try{
+      const r = await be.ensureMember(team, S.name, S.teamKey, !!S.creating, LS.get('rider-member-'+team,false));
+      if(S.team!==team) return;
+      S.uid = r.uid; S.creating=false;
+      if(r.key){ S.teamKey=r.key; LS.set('rider-key-'+team, r.key); }
+      LS.set('rider-member-'+team, true);
+      if(r.created) setTimeout(()=>{ go('team'); toast('Команда создана — отправь приглашение'); },50);
+    }catch(e){
+      console.warn('access', e); if(S.team!==team) return;
+      S.creating=false; S.access='denied'; S.loaded=true; render(); return;
+    }
+  }
+  S.access='ok'; syncUrlTeam();
+  if(be.subscribeTeam) unsubTeam=be.subscribeTeam(team, d=>{
+    S.teamInfo=cleanTeamInfo(d);
+    if(S.teamInfo && S.teamInfo.joinKey && S.teamInfo.joinKey!==S.teamKey){ S.teamKey=S.teamInfo.joinKey; LS.set('rider-key-'+team,S.teamKey); syncUrlTeam(); }
+    softRender();
+  }, e=>{ if(isDenied(e)) lostAccess(); });
+  if(be.subscribeMembers) unsubMembers=be.subscribeMembers(team, list=>{ S.members=cleanMembers(list);
+    if(S.uid && S.loaded && !S.members.some(m=>m.id===S.uid) && list.length) { lostAccess(); return; }
+    if(view.name==='team') softRender(); }, e=>{ if(isDenied(e)) lostAccess(); });
   touchMember(true);
   const t=setTimeout(()=>{ if(!S.loaded){ S.stale=true; render(); } },10000);
-  unsub = be.subscribe(S.team, list=>{
+  unsub = be.subscribe(team, list=>{
     S.services=list.map(x=>cleanSvc(x.id,x)).filter(Boolean); sortServices(); S.loaded=true; S.stale=false; clearTimeout(t); softRender();
   }, inv=>{
     if(inv) S.inv=cleanInv(inv); softRender();
-  }, err=>{ S.err=err; S.loaded=true; clearTimeout(t); render(); });
+  }, err=>{ clearTimeout(t); if(isDenied(err)){ lostAccess(); return; } S.err=err; S.loaded=true; render(); });
 }
 
 // patch — только изменённые поля ('packed.xlr': true / null = удалить). Без patch — документ целиком (новый).
@@ -176,24 +212,55 @@ function onWriteErr(e){ console.error(e); const c=e&&e.code;
   toast(c==='permission-denied'?'Нет доступа к этой команде':c==='not-found'?'Это служение уже удалили':'Не сохранилось, проверь интернет'); }
 function sortServices(){ S.services.sort((a,b)=>(b.date||'').localeCompare(a.date||'') || (b.updatedAt||0)-(a.updatedAt||0)); }
 
-/* ===================== Команда (приглашение по ссылке) ===================== */
-function inviteLink(){ const u=new URL(location.href); u.hash=''; u.search='?team='+S.team; return u.toString(); }
-function readTeamFromUrl(){
-  const u=new URL(location.href); const t=(u.searchParams.get('team')||'').trim().toLowerCase();
-  return /^[a-z0-9]{16,40}$/.test(t)?t:null;
+/* ---- Действия админа ---- */
+async function kickMember(id){
+  const be=S.backend; if(!isAdmin() || id===S.uid) return;
+  try{
+    const nk=randId(20);
+    await be.updateTeam(S.team, {joinKey:nk, admins:S.teamInfo.admins.filter(x=>x!==id)});   // сначала новый ключ
+    await be.removeMember(S.team, id);                                                      // потом убираем человека
+    S.teamKey=nk; LS.set('rider-key-'+S.team,nk); syncUrlTeam();
+    toast('Убран из команды. Ссылка-приглашение обновилась — старая больше не работает');
+  }catch(e){ console.error(e); toast('Не получилось: '+((e&&e.code)||'ошибка')); }
 }
-// Код команды держим в адресной строке: при «На экран „Домой“» он попадёт в ярлык,
+async function setAdmin(id, on){
+  if(!isAdmin()) return; const cur=S.teamInfo.admins;
+  const next = on ? Array.from(new Set(cur.concat(id))).slice(0,10) : cur.filter(x=>x!==id);
+  if(!next.length){ toast('Нужен хотя бы один админ'); return; }
+  try{ await S.backend.updateTeam(S.team, {admins:next}); toast(on?'Теперь админ':'Больше не админ'); }
+  catch(e){ console.error(e); toast('Не получилось: '+((e&&e.code)||'ошибка')); }
+}
+async function rotateKey(){
+  if(!isAdmin()) return; const nk=randId(20);
+  try{ await S.backend.updateTeam(S.team, {joinKey:nk}); S.teamKey=nk; LS.set('rider-key-'+S.team,nk); syncUrlTeam(); toast('Новая ссылка готова. Старая больше не работает, но кто уже в команде — остаются'); }
+  catch(e){ console.error(e); toast('Не получилось: '+((e&&e.code)||'ошибка')); }
+}
+
+/* ===================== Команда (приглашение по ссылке) ===================== */
+function inviteLink(){ const u=new URL(location.href); u.hash=''; u.search='?team='+S.team+(S.teamKey?'&k='+S.teamKey:''); return u.toString(); }
+function readTeamFromUrl(){
+  const u=new URL(location.href); const t=(u.searchParams.get('team')||'').trim().toLowerCase(); const k=(u.searchParams.get('k')||'').trim().toLowerCase();
+  return CODE_RE.test(t) ? {team:t, key: CODE_RE.test(k)?k:null} : null;
+}
+// Код команды и ключ держим в адресной строке: при «На экран „Домой“» они попадут в ярлык,
 // и установленное приложение сразу откроется в нужной команде.
 function syncUrlTeam(){
   const u=new URL(location.href);
-  if(S.team) u.searchParams.set('team',S.team); else u.searchParams.delete('team');
+  if(S.team && S.access!=='denied'){ u.searchParams.set('team',S.team); if(S.teamKey) u.searchParams.set('k',S.teamKey); else u.searchParams.delete('k'); }
+  else { u.searchParams.delete('team'); u.searchParams.delete('k'); }
   const next=u.pathname+(u.search||'')+u.hash; if(next!==location.pathname+location.search+location.hash) history.replaceState(null,'',next);
 }
 function parseTeamInput(v){
-  v=(v||'').trim(); try{ const u=new URL(v); v=u.searchParams.get('team')||''; }catch(e){}
-  v=v.toLowerCase(); return /^[a-z0-9]{16,40}$/.test(v)?v:null;
+  v=(v||'').trim(); let t=v, k=null;
+  try{ const u=new URL(v); t=u.searchParams.get('team')||''; k=u.searchParams.get('k'); }catch(e){}
+  t=(t||'').toLowerCase(); k=(k||'').toLowerCase();
+  return CODE_RE.test(t) ? {team:t, key: CODE_RE.test(k)?k:null} : null;
 }
-function setTeam(t){ S.team=t; LS.set('rider-team',t); syncUrlTeam(); connect(); go(''); }
+function setTeam(t, key){
+  S.team=t; S.teamKey = key || LS.get('rider-key-'+t, null); S.access='checking';
+  LS.set('rider-team',t); if(key) LS.set('rider-key-'+t,key);
+  connect(); go('');
+}
 
 /* ===================== UI ===================== */
 let view={name:'list', id:null, tab:'lineup'};
@@ -224,6 +291,8 @@ function render(){
   const app=$('#app'); let h='';
   if(S.mode==='loading'){ app.innerHTML='<p class="muted">Загрузка…</p>'; return; }
   if(!S.team || !S.name){ app.innerHTML=renderOnboarding(); return; }
+  if(S.access==='denied'){ app.innerHTML=renderDenied(); if(sheet) renderSheet(); return; }
+  if(S.access==='checking'){ app.innerHTML='<p class="muted">Проверяю доступ к команде…</p>'; return; }
   if(!S.loaded){ app.innerHTML = S.stale ? '<div class="banner bad">Нет связи с базой. Как появится интернет, данные подтянутся сами.</div>' : '<p class="muted">Загрузка…</p>'; return; }
   if(view.name==='svc' && !curSvc()) view={name:'list'};
   if(view.name==='list') h=renderList();
@@ -249,11 +318,11 @@ function renderOnboarding(){
   <label class="f">Как тебя зовут</label><input type="text" id="obName" maxlength="40" value="${esc(S.name)}" placeholder="Например: Иосиф"></div>`;
   if(pending){
     h+=`<div class="card"><b>Тебя пригласили в команду</b><p class="small muted">Введи имя и нажми «Войти».</p>
-    <button class="btn block" onclick="obJoin('${pending}')">Войти в команду</button></div>`;
+    <button class="btn block" onclick="obJoinPending()">Войти в команду</button></div>`;
   } else if(!S.team){
     h+=`<div class="card"><b>У меня есть ссылка-приглашение</b><p class="small muted" style="margin:2px 0 8px">Вставь ссылку, которую тебе прислали.</p>
-      <input type="text" id="obInvite" placeholder="https://…?team=…"><button class="btn block" style="margin-top:10px" onclick="obJoin()">Войти в команду</button></div>
-      <div class="card"><b>Я первый — создать команду</b><p class="small muted" style="margin:2px 0 8px">Потом отправишь ссылку остальным.</p>
+      <input type="text" id="obInvite" placeholder="https://…?team=…&k=…"><button class="btn block" style="margin-top:10px" onclick="obJoin()">Войти в команду</button></div>
+      <div class="card"><b>Я первый — создать команду</b><p class="small muted" style="margin:2px 0 8px">Ты станешь админом: сможешь приглашать и убирать людей.${(!isStandalone() && /iphone|ipad|ipod/i.test(navigator.userAgent))?' <b>Лучше сначала установи приложение на экран «Домой» и создавай команду уже в нём</b> — тогда права админа будут у установленного приложения.':''}</p>
       <button class="btn ghost block" onclick="obCreate()">Создать команду</button></div>`;
   } else {
     h+=`<button class="btn block" onclick="obSaveName()">Продолжить</button>`;
@@ -268,9 +337,22 @@ function installHint(){
     : 'В Chrome: меню ⋮ → «Добавить на главный экран» / «Установить приложение».'}</p></div>`;
 }
 function readObName(){ const v=(($('#obName')||{}).value||'').trim().slice(0,40); if(!v){ toast('Впиши имя'); return null; } S.name=v; LS.set('rider-name',v); return v; }
-function obJoin(t){ if(!readObName()) return; t=t||parseTeamInput(($('#obInvite')||{}).value); if(!t){ toast('Не похоже на ссылку-приглашение'); return; } S.pendingTeam=null; setTeam(t); }
-function obCreate(){ if(!readObName()) return; setTeam(randId(20)); setTimeout(()=>{ go('team'); toast('Команда создана — отправь ссылку остальным'); },50); }
+function obJoinPending(){ if(!readObName()) return; const p=S.pendingTeam; S.pendingTeam=null; if(p) setTeam(p.team, p.key); }
+function obJoin(){ if(!readObName()) return; const t=parseTeamInput(($('#obInvite')||{}).value); if(!t){ toast('Не похоже на ссылку-приглашение'); return; } S.pendingTeam=null; setTeam(t.team, t.key); }
+function obCreate(){ if(!readObName()) return; S.creating=true; setTeam(randId(20), randId(20)); }
 function obSaveName(){ if(!readObName()) return; render(); }
+
+function renderDenied(){
+  let h=`<header class="top"><h1>Райдер служения</h1></header>
+  <div class="card"><b>Нет доступа к команде</b><p class="small muted" style="margin:4px 0 0">Тебя убрали из команды, или ссылка-приглашение устарела (админ её обновил). Попроси у админа новую ссылку и вставь сюда.</p>
+  <input type="text" id="obInvite" style="margin-top:10px" placeholder="https://…?team=…&k=…">
+  <button class="btn block" style="margin-top:10px" onclick="deniedJoin()">Войти по новой ссылке</button></div>
+  <div class="card"><b>Или создать свою команду</b><p class="small muted" style="margin:2px 0 8px">Ты станешь в ней админом.</p>
+  <button class="btn ghost block" onclick="deniedCreate()">Создать команду</button></div>`;
+  return h;
+}
+function deniedJoin(){ const t=parseTeamInput(($('#obInvite')||{}).value); if(!t || !t.key){ toast('В ссылке нет ключа — попроси новую'); return; } setTeam(t.team, t.key); }
+function deniedCreate(){ S.creating=true; setTeam(randId(20), randId(20)); }
 
 function renderList(){
   let h=`<header class="top"><h1>Райдер служения</h1><button class="iconbtn" onclick="go('sklad')">Склад</button><button class="iconbtn" onclick="go('team')">Команда</button></header>`+topBanners();
@@ -389,17 +471,25 @@ function renderStock(){
 
 function renderTeam(){
   let h=`<header class="top"><button class="iconbtn" onclick="go('')">← Назад</button><h1 class="grow" style="font-size:17px">Команда</h1></header>`+topBanners();
+  const admin=isAdmin(); const adm=(S.teamInfo&&S.teamInfo.admins)||[];
   h+=`<div class="card"><b>Пригласить людей</b><p class="small muted" style="margin:2px 0 8px">Отправь эту ссылку лидерам прославления и звукарям. Кто откроет — сможет смотреть и менять состав. Не выкладывай её публично.</p>
     <input type="text" readonly value="${esc(inviteLink())}" onclick="this.select()">
-    <button class="btn block" style="margin-top:10px" onclick="shareInvite()">Отправить приглашение</button></div>
-    <div class="card"><label class="f">Твоё имя (видно в «Последнее изменение»)</label>
+    <button class="btn block" style="margin-top:10px" onclick="shareInvite()">Отправить приглашение</button>
+    ${admin?`<button class="btn ghost block" style="margin-top:8px" onclick="askRotate()">Сделать новую ссылку (старая перестанет работать)</button>`:''}</div>`;
+  h+=`<div class="card small"><b>${admin?'Ты админ этой команды':'Ты участник'}</b><p class="muted" style="margin:4px 0 0">${admin
+      ?'Можешь убирать людей и назначать админов. Если удалишь приложение или очистишь Safari, права пропадут — поэтому лучше назначь админом ещё кого-то надёжного.'
+      :'Убирать людей и обновлять ссылку могут только админы.'}</p></div>`;
+  h+=`
+<div class="card"><label class="f">Твоё имя (видно в «Последнее изменение»)</label>
     <input type="text" maxlength="40" data-keep="1" value="${esc(S.name)}" oninput="setName(this.value)"></div>`;
   const ms=S.members||[];
   h+=`<div class="card"><b>Кто в команде${ms.length?' ('+ms.length+')':''}</b>`;
   if(!S.backend || !S.backend.subscribeMembers) h+=`<p class="small muted">Список появится, когда подключена общая база.</p>`;
   else if(!ms.length) h+=`<p class="small muted">Пока никого, кроме тебя. Отправь приглашение.</p>`;
-  for(const m of ms) h+=`<div class="lu"><div class="grow"><div class="nm">${esc(m.name)}${m.me?' <span class="pill">это ты</span>':''}</div>
-    <div class="small muted">${esc(ago(m.lastSeen))}${m.joinedAt?' · в команде с '+esc(new Date(m.joinedAt).toLocaleDateString('ru-RU',{day:'numeric',month:'short'})):''}</div></div></div>`;
+  ms.forEach((m,i)=>{ const isA=adm.includes(m.id);
+    h+=`<div class="lu" style="flex-wrap:wrap"><div class="grow"><div class="nm">${esc(m.name)}${m.me?' <span class="pill">это ты</span>':''}${isA?' <span class="pill ok">админ</span>':''}</div>
+    <div class="small muted">${esc(ago(m.lastSeen))}${m.joinedAt?' · в команде с '+esc(new Date(m.joinedAt).toLocaleDateString('ru-RU',{day:'numeric',month:'short'})):''}</div></div>
+    ${admin && !m.me?`<div class="row" style="gap:6px"><button class="iconbtn small" onclick="memberAdmin(${i},${!isA})">${isA?'Снять админа':'Сделать админом'}</button><button class="iconbtn small" style="color:var(--bad)" onclick="askKick(${i})">Убрать</button></div>`:''}</div>`; });
   if(ms.length) h+=`<p class="small muted" style="margin:8px 0 0">Один человек может быть в списке дважды, если открыл и в браузере, и с экрана «Домой».</p>`;
   h+=`</div>`;
   if(!isStandalone()) h+=installHint();
@@ -462,6 +552,10 @@ function renderSheet(){
       <p class="small muted" style="margin-top:10px">«Сколько» — например, 3 бэк-вокала без имён. Если знаешь имена, лучше добавлять по одному.</p>`;
   } else if(sheet.kind==='del'){
     h+=`<h2>Удалить служение?</h2><p class="muted">Состав и отметки пропадут у всех.</p><div class="row"><button class="btn ghost grow" onclick="closeSheet()">Отмена</button><button class="btn grow" style="background:var(--bad)" onclick="doDelete()">Удалить</button></div>`;
+  } else if(sheet.kind==='kick'){
+    h+=`<h2>Убрать «${esc(sheet.name)}» из команды?</h2><p class="muted">Доступ у этого телефона пропадёт сразу. Ссылка-приглашение обновится — старую нельзя будет использовать снова. Кто уже в команде, останутся; новым людям отправляй новую ссылку.</p><div class="row"><button class="btn ghost grow" onclick="closeSheet()">Отмена</button><button class="btn grow" style="background:var(--bad)" onclick="doKick()">Убрать</button></div>`;
+  } else if(sheet.kind==='rotate'){
+    h+=`<h2>Сделать новую ссылку?</h2><p class="muted">Старая ссылка-приглашение перестанет работать. Все, кто уже в команде, останутся.</p><div class="row"><button class="btn ghost grow" onclick="closeSheet()">Отмена</button><button class="btn grow" onclick="doRotate()">Обновить</button></div>`;
   } else if(sheet.kind==='leave'){
     h+=`<h2>Выйти из команды?</h2><p class="muted">На этом телефоне пропадёт доступ. Данные команды останутся у остальных. Вернуться можно по ссылке-приглашению.</p><div class="row"><button class="btn ghost grow" onclick="closeSheet()">Отмена</button><button class="btn grow" style="background:var(--bad)" onclick="doLeave()">Выйти</button></div>`;
   } else if(sheet.kind==='copy'){
@@ -479,7 +573,14 @@ function confirmAdd(){
   saveService(s,{lineup:s.lineup}); closeSheet(); render();
 }
 function doDelete(){ const id=view.id; closeSheet(); deleteService(id); go(''); }
-function doLeave(){ closeSheet(); if(S.backend && S.backend.leaveMember && S.team) Promise.resolve(S.backend.leaveMember(S.team)).catch(()=>{}); if(unsubMembers){ try{unsubMembers();}catch(e){} unsubMembers=null; } if(unsub){ try{unsub();}catch(e){} unsub=null; } LS.del('rider-team'); S.team=null; S.loaded=false; syncUrlTeam(); go(''); }
+function doLeave(){ closeSheet(); const t=S.team; stopSubs();
+  if(S.backend && S.backend.leaveMember && t && S.access==='ok') Promise.resolve(S.backend.leaveMember(t)).catch(()=>{});
+  LS.del('rider-team'); LS.del('rider-member-'+t); S.team=null; S.teamKey=null; S.teamInfo=null; S.access=null; S.loaded=false; syncUrlTeam(); go(''); }
+function memberAdmin(i,on){ const m=(S.members||[])[i]; if(m) setAdmin(m.id,on); }
+function askKick(i){ const m=(S.members||[])[i]; if(!m) return; sheet={kind:'kick', id:m.id, name:m.name}; renderSheet(); }
+function doKick(){ const id=sheet&&sheet.id; closeSheet(); if(id) kickMember(id); }
+function askRotate(){ sheet={kind:'rotate'}; renderSheet(); }
+function doRotate(){ closeSheet(); rotateKey(); }
 
 /* ===================== Запуск ===================== */
 window.startApp = function(backend){
@@ -487,10 +588,10 @@ window.startApp = function(backend){
   S.name = LS.get('rider-name','');
   const fromUrl = readTeamFromUrl();
   const saved = LS.get('rider-team', null);
-  if(fromUrl && fromUrl!==saved){ if(S.name){ S.team=fromUrl; LS.set('rider-team',fromUrl); } else S.pendingTeam=fromUrl; }
-  else S.team = saved;
   S.mode='ready';
-  if(S.team){ syncUrlTeam(); connect(); }
+  if(fromUrl && (fromUrl.team!==saved || (fromUrl.key && fromUrl.key!==LS.get('rider-key-'+fromUrl.team,null)))){
+    if(S.name) setTeam(fromUrl.team, fromUrl.key); else S.pendingTeam=fromUrl;
+  } else if(saved){ S.team=saved; S.teamKey=LS.get('rider-key-'+saved,null); connect(); }
   route();
 };
 window.localBackend = localBackend;

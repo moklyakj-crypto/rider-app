@@ -137,17 +137,43 @@ async function firebaseBackend(){
     async patchService(team, id, patch) { await authed; const p = {};
       for (const k in patch) p[k] = patch[k] === null ? F.deleteField() : patch[k];
       return F.updateDoc(F.doc(db, 'teams', team, 'services', id), p); },
-    // Участники: каждый телефон пишет только свою карточку (имя и когда заходил).
-    async touchMember(team, name, first) { const u = await authed;
-      const ref = F.doc(db, 'teams', team, 'members', u.uid); const now = Date.now();
-      const data = { name: String(name || '').slice(0, 40), lastSeen: now };
-      if (first) data.joinedAt = now;
-      return F.setDoc(ref, data, { merge: true }); },
+    // Вход в команду. Возвращает {uid, key?, created?}; если доступа нет — бросает ошибку.
+    async ensureMember(team, name, key, creating, wasMember) {
+      const u = await authed; const uid = u.uid; const now = Date.now();
+      const teamRef = F.doc(db, 'teams', team), meRef = F.doc(db, 'teams', team, 'members', uid);
+      const nm = String(name || '').slice(0, 40);
+      try {
+        const snap = await F.getDoc(meRef);
+        if (snap.exists()) return { uid };
+      } catch (e) {
+        if (e && e.code === 'unavailable' && wasMember) return { uid };   // без сети — работаем из кэша
+        if (!(e && e.code === 'permission-denied')) throw e;
+      }
+      if (creating || !key) {
+        // Новая команда (или старая команда без админа): создаём карточку команды и становимся админом.
+        const k = key || Array.from(crypto.getRandomValues(new Uint8Array(20)), (x) => 'abcdefghijkmnpqrstuvwxyz23456789'[x % 32]).join('');
+        const b = F.writeBatch(db);
+        b.set(teamRef, { admins: [uid], joinKey: k, createdAt: now });
+        b.set(meRef, { name: nm, lastSeen: now, joinedAt: now, key: k });
+        await b.commit();
+        return { uid, key: k, created: !!creating };
+      }
+      await F.setDoc(meRef, { name: nm, lastSeen: now, joinedAt: now, key });
+      return { uid };
+    },
+    async touchMember(team, name) { const u = await authed;
+      return F.setDoc(F.doc(db, 'teams', team, 'members', u.uid), { name: String(name || '').slice(0, 40), lastSeen: Date.now() }, { merge: true }); },
     async leaveMember(team) { const u = await authed; return F.deleteDoc(F.doc(db, 'teams', team, 'members', u.uid)); },
-    subscribeMembers(team, cb) { let off = null, dead = false;
+    async removeMember(team, id) { await authed; return F.deleteDoc(F.doc(db, 'teams', team, 'members', id)); },
+    async updateTeam(team, patch) { await authed; return F.updateDoc(F.doc(db, 'teams', team), patch); },
+    subscribeTeam(team, cb, onErr) { let off = null, dead = false;
+      authed.then(() => { if (dead) return;
+        off = F.onSnapshot(F.doc(db, 'teams', team), (s) => cb(s.exists() ? s.data() : null), onErr || (() => {})); });
+      return () => { dead = true; if (off) off(); }; },
+    subscribeMembers(team, cb, onErr) { let off = null, dead = false;
       authed.then((u) => { if (dead) return;
         off = F.onSnapshot(F.collection(db, 'teams', team, 'members'),
-          (snap) => cb(snap.docs.map((d) => Object.assign({ id: d.id, me: d.id === u.uid }, d.data()))), () => {}); });
+          (snap) => cb(snap.docs.map((d) => Object.assign({ id: d.id, me: d.id === u.uid }, d.data()))), onErr || (() => {})); });
       return () => { dead = true; if (off) off(); }; },
     async deleteService(team, id) { await authed; return F.deleteDoc(F.doc(db, 'teams', team, 'services', id)); },
     async saveInv(team, inv) { await authed; return F.setDoc(F.doc(db, 'teams', team, 'meta', 'inventory'), inv); },

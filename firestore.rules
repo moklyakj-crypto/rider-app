@@ -1,21 +1,52 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Только из приложения (анонимный вход) и только к своей команде.
-    // Код команды длинный и случайный, его знают только те, кому прислали ссылку.
-    function teamOk(team) {
-      return request.auth != null && team.matches('^[a-z0-9]{16,40}$');
+    // Доступ к данным команды есть только у её участников.
+    // Стать участником можно только с действующим ключом из ссылки-приглашения.
+    // Админ может убрать человека и сменить ключ — тогда по старой ссылке не войти.
+    function authed() { return request.auth != null; }
+    function codeOk(c) { return c is string && c.matches('^[a-z0-9]{16,40}$'); }
+    function teamRef(team) { return /databases/$(database)/documents/teams/$(team); }
+    function memberRef(team, uid) { return /databases/$(database)/documents/teams/$(team)/members/$(uid); }
+    function isMember(team) { return authed() && codeOk(team) && exists(memberRef(team, request.auth.uid)); }
+    function isAdmin(team) { return isMember(team) && request.auth.uid in get(teamRef(team)).data.admins; }
+    function strMax(d, key, n) { return !(key in d) || (d[key] is string && d[key].size() <= n); }
+    function mapMax(d, key, n) { return !(key in d) || (d[key] is map && d[key].size() <= n); }
+    function teamShape(d) {
+      return d.keys().hasOnly(['admins', 'joinKey', 'createdAt'])
+        && d.admins is list && d.admins.size() >= 1 && d.admins.size() <= 10
+        && codeOk(d.joinKey);
     }
-    function strMax(d, key, n) {
-      return !(key in d) || (d[key] is string && d[key].size() <= n);
+
+    // Карточка команды: список админов и текущий ключ приглашения.
+    match /teams/{team} {
+      allow read: if isMember(team);
+      allow create: if authed() && codeOk(team) && teamShape(request.resource.data)
+        && request.resource.data.admins == [request.auth.uid];
+      allow update: if isAdmin(team) && teamShape(request.resource.data);
+      allow delete: if false;
     }
-    function mapMax(d, key, n) {
-      return !(key in d) || (d[key] is map && d[key].size() <= n);
+
+    // Участники: войти можно только с текущим ключом; свою карточку правит сам человек,
+    // убрать из команды может он сам или админ.
+    match /teams/{team}/members/{mid} {
+      allow read: if isMember(team);
+      allow create: if authed() && codeOk(team) && mid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['name', 'joinedAt', 'lastSeen', 'key'])
+        && strMax(request.resource.data, 'name', 40)
+        && request.resource.data.lastSeen is number
+        && request.resource.data.key == getAfter(teamRef(team)).data.joinKey;
+      allow update: if authed() && codeOk(team) && mid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['name', 'joinedAt', 'lastSeen', 'key'])
+        && strMax(request.resource.data, 'name', 40)
+        && request.resource.data.lastSeen is number
+        && request.resource.data.key == resource.data.key;
+      allow delete: if authed() && codeOk(team) && (mid == request.auth.uid || isAdmin(team));
     }
 
     match /teams/{team}/services/{sid} {
-      allow read, delete: if teamOk(team);
-      allow create, update: if teamOk(team)
+      allow read, delete: if isMember(team);
+      allow create, update: if isMember(team)
         && sid.matches('^s[a-z0-9]{6,30}$')
         && request.resource.data.keys().hasOnly(['date', 'title', 'notes', 'lineup', 'mon', 'packed', 'updatedAt', 'updatedByName'])
         && strMax(request.resource.data, 'date', 10)
@@ -29,21 +60,11 @@ service cloud.firestore {
     }
 
     match /teams/{team}/meta/inventory {
-      allow read: if teamOk(team);
-      allow create, update: if teamOk(team)
+      allow read: if isMember(team);
+      allow create, update: if isMember(team)
         && request.resource.data.keys().hasOnly(['stock', 'spare'])
         && mapMax(request.resource.data, 'stock', 40)
         && mapMax(request.resource.data, 'spare', 4);
-    }
-    // Участники: читают все в команде, а пишет каждый только свою карточку.
-    match /teams/{team}/members/{mid} {
-      allow read: if teamOk(team);
-      allow delete: if teamOk(team) && mid == request.auth.uid;
-      allow create, update: if teamOk(team) && mid == request.auth.uid
-        && request.resource.data.keys().hasOnly(['name', 'joinedAt', 'lastSeen'])
-        && strMax(request.resource.data, 'name', 40)
-        && request.resource.data.lastSeen is number
-        && (!('joinedAt' in request.resource.data) || request.resource.data.joinedAt is number);
     }
     // Всё остальное закрыто.
   }
