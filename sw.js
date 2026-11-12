@@ -1,5 +1,5 @@
 // Офлайн-кэш: сначала сеть (чтобы обновления приходили сразу), без сети — из кэша.
-const CACHE = 'rider-v3';
+const CACHE = 'rider-v4';
 const SHELL = ['./', './index.html', './config.js', './app.js', './firebase.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 
@@ -19,7 +19,7 @@ self.addEventListener('fetch', e => {
   const cacheable = url.origin === self.location.origin;
   if (!cacheable) return;
   e.respondWith(
-    fetch(req).then(res => {
+    fetch(req, { cache: 'no-cache' }).then(res => {
       if (res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); }
       return res;
     }).catch(() => caches.match(req, { ignoreSearch: true }).then(r => r || caches.match('./index.html')))
