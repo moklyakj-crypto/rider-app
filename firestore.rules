@@ -35,6 +35,16 @@ service cloud.firestore {
         && mapMax(request.resource.data, 'stock', 40)
         && mapMax(request.resource.data, 'spare', 4);
     }
+    // Участники: читают все в команде, а пишет каждый только свою карточку.
+    match /teams/{team}/members/{mid} {
+      allow read: if teamOk(team);
+      allow delete: if teamOk(team) && mid == request.auth.uid;
+      allow create, update: if teamOk(team) && mid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['name', 'joinedAt', 'lastSeen'])
+        && strMax(request.resource.data, 'name', 40)
+        && request.resource.data.lastSeen is number
+        && (!('joinedAt' in request.resource.data) || request.resource.data.joinedAt is number);
+    }
     // Всё остальное закрыто.
   }
 }

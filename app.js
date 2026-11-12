@@ -123,11 +123,36 @@ function cleanInv(d){
   return {stock, spare};
 }
 
+/* ---- Участники команды ---- */
+let unsubMembers=null, lastTouch=0;
+function cleanMembers(list){
+  return (list||[]).filter(m=>m && typeof m.id==='string' && /^[A-Za-z0-9]{10,64}$/.test(m.id))
+    .map(m=>({id:m.id, me:!!m.me, name:str(m.name,40)||'Без имени', lastSeen:typeof m.lastSeen==='number'?m.lastSeen:0, joinedAt:typeof m.joinedAt==='number'?m.joinedAt:0}))
+    .sort((a,b)=> (b.me-a.me) || (b.lastSeen-a.lastSeen));
+}
+function touchMember(force){
+  const be=S.backend; if(!be || !be.touchMember || !S.team || !S.name) return;
+  const now=Date.now(); if(!force && now-lastTouch<10*60*1000) return; lastTouch=now;
+  const firstKey='rider-joined-'+S.team; const first=!LS.get(firstKey,false);
+  Promise.resolve(be.touchMember(S.team, S.name, first)).then(()=>{ if(first) LS.set(firstKey,true); }).catch(e=>console.warn('member',e));
+}
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') touchMember(false); });
+function ago(t){
+  if(!t) return 'давно'; const m=Math.round((Date.now()-t)/60000);
+  if(m<5) return 'сейчас в приложении'; if(m<60) return m+' мин назад';
+  const h=Math.round(m/60); if(h<24) return h+' ч назад';
+  const d=Math.round(h/24); if(d<30) return d+' дн назад';
+  return new Date(t).toLocaleDateString('ru-RU',{day:'numeric',month:'short'});
+}
+
 let unsub=null;
 function connect(){
   if(unsub){ try{unsub();}catch(e){} unsub=null; }
-  S.loaded=false; S.services=[]; S.inv={stock:{},spare:{xlr:2,jack:1}}; S.err=null;
+  S.loaded=false; S.services=[]; S.inv={stock:{},spare:{xlr:2,jack:1}}; S.err=null; S.members=[];
   const be=S.backend;
+  if(unsubMembers){ try{unsubMembers();}catch(e){} unsubMembers=null; }
+  if(be.subscribeMembers) unsubMembers=be.subscribeMembers(S.team, list=>{ S.members=cleanMembers(list); if(view.name==='team') softRender(); });
+  touchMember(true);
   const t=setTimeout(()=>{ if(!S.loaded){ S.stale=true; render(); } },10000);
   unsub = be.subscribe(S.team, list=>{
     S.services=list.map(x=>cleanSvc(x.id,x)).filter(Boolean); sortServices(); S.loaded=true; S.stale=false; clearTimeout(t); softRender();
@@ -369,6 +394,14 @@ function renderTeam(){
     <button class="btn block" style="margin-top:10px" onclick="shareInvite()">Отправить приглашение</button></div>
     <div class="card"><label class="f">Твоё имя (видно в «Последнее изменение»)</label>
     <input type="text" maxlength="40" data-keep="1" value="${esc(S.name)}" oninput="setName(this.value)"></div>`;
+  const ms=S.members||[];
+  h+=`<div class="card"><b>Кто в команде${ms.length?' ('+ms.length+')':''}</b>`;
+  if(!S.backend || !S.backend.subscribeMembers) h+=`<p class="small muted">Список появится, когда подключена общая база.</p>`;
+  else if(!ms.length) h+=`<p class="small muted">Пока никого, кроме тебя. Отправь приглашение.</p>`;
+  for(const m of ms) h+=`<div class="lu"><div class="grow"><div class="nm">${esc(m.name)}${m.me?' <span class="pill">это ты</span>':''}</div>
+    <div class="small muted">${esc(ago(m.lastSeen))}${m.joinedAt?' · в команде с '+esc(new Date(m.joinedAt).toLocaleDateString('ru-RU',{day:'numeric',month:'short'})):''}</div></div></div>`;
+  if(ms.length) h+=`<p class="small muted" style="margin:8px 0 0">Один человек может быть в списке дважды, если открыл и в браузере, и с экрана «Домой».</p>`;
+  h+=`</div>`;
   if(!isStandalone()) h+=installHint();
   h+=`<button class="btn danger block" onclick="askLeave()">Выйти из команды на этом телефоне</button>`;
   return h;
@@ -387,7 +420,7 @@ let invT=null;
 function setStock(k,v){ if(v===''||v==null) delete S.inv.stock[k]; else S.inv.stock[k]=Math.max(0,parseInt(v,10)||0); clearTimeout(invT); invT=setTimeout(saveInv,700); }
 function setSpare(k,v){ S.inv.spare[k]=Math.max(0,parseInt(v,10)||0); clearTimeout(invT); invT=setTimeout(saveInv,700); }
 let nameT=null;
-function setName(v){ clearTimeout(nameT); nameT=setTimeout(()=>{ v=v.trim().slice(0,40); if(v){ S.name=v; LS.set('rider-name',v); } },500); }
+function setName(v){ clearTimeout(nameT); nameT=setTimeout(()=>{ v=v.trim().slice(0,40); if(v){ S.name=v; LS.set('rider-name',v); touchMember(true); } },500); }
 
 function listText(){
   const s=curSvc(); const c=calc(s,S.inv); const d=fmtDate(s.date);
@@ -446,7 +479,7 @@ function confirmAdd(){
   saveService(s,{lineup:s.lineup}); closeSheet(); render();
 }
 function doDelete(){ const id=view.id; closeSheet(); deleteService(id); go(''); }
-function doLeave(){ closeSheet(); if(unsub){ try{unsub();}catch(e){} unsub=null; } LS.del('rider-team'); S.team=null; S.loaded=false; syncUrlTeam(); go(''); }
+function doLeave(){ closeSheet(); if(S.backend && S.backend.leaveMember && S.team) Promise.resolve(S.backend.leaveMember(S.team)).catch(()=>{}); if(unsubMembers){ try{unsubMembers();}catch(e){} unsubMembers=null; } if(unsub){ try{unsub();}catch(e){} unsub=null; } LS.del('rider-team'); S.team=null; S.loaded=false; syncUrlTeam(); go(''); }
 
 /* ===================== Запуск ===================== */
 window.startApp = function(backend){

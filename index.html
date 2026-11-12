@@ -137,6 +137,18 @@ async function firebaseBackend(){
     async patchService(team, id, patch) { await authed; const p = {};
       for (const k in patch) p[k] = patch[k] === null ? F.deleteField() : patch[k];
       return F.updateDoc(F.doc(db, 'teams', team, 'services', id), p); },
+    // Участники: каждый телефон пишет только свою карточку (имя и когда заходил).
+    async touchMember(team, name, first) { const u = await authed;
+      const ref = F.doc(db, 'teams', team, 'members', u.uid); const now = Date.now();
+      const data = { name: String(name || '').slice(0, 40), lastSeen: now };
+      if (first) data.joinedAt = now;
+      return F.setDoc(ref, data, { merge: true }); },
+    async leaveMember(team) { const u = await authed; return F.deleteDoc(F.doc(db, 'teams', team, 'members', u.uid)); },
+    subscribeMembers(team, cb) { let off = null, dead = false;
+      authed.then((u) => { if (dead) return;
+        off = F.onSnapshot(F.collection(db, 'teams', team, 'members'),
+          (snap) => cb(snap.docs.map((d) => Object.assign({ id: d.id, me: d.id === u.uid }, d.data()))), () => {}); });
+      return () => { dead = true; if (off) off(); }; },
     async deleteService(team, id) { await authed; return F.deleteDoc(F.doc(db, 'teams', team, 'services', id)); },
     async saveInv(team, inv) { await authed; return F.setDoc(F.doc(db, 'teams', team, 'meta', 'inventory'), inv); },
   };
