@@ -171,7 +171,8 @@ async function connect(){
       const r = await be.ensureMember(team, S.name, S.teamKey, !!S.creating, LS.get('rider-member-'+team,false));
       if(S.team!==team) return;
       S.uid = r.uid; S.creating=false;
-      if(r.key){ S.teamKey=r.key; LS.set('rider-key-'+team, r.key); }
+      if(r.key) S.teamKey=r.key;
+      if(S.teamKey) LS.set('rider-key-'+team, S.teamKey);
       LS.set('rider-member-'+team, true);
       if(r.created) setTimeout(()=>{ go('team'); toast('Команда создана — отправь приглашение'); },50);
     }catch(e){
@@ -258,7 +259,7 @@ function parseTeamInput(v){
 }
 function setTeam(t, key){
   S.team=t; S.teamKey = key || LS.get('rider-key-'+t, null); S.access='checking';
-  LS.set('rider-team',t); if(key) LS.set('rider-key-'+t,key);
+  LS.set('rider-team',t);
   connect(); go('');
 }
 
@@ -344,7 +345,7 @@ function obSaveName(){ if(!readObName()) return; render(); }
 
 function renderDenied(){
   let h=`<header class="top"><h1>Райдер служения</h1></header>
-  <div class="card"><b>Нет доступа к команде</b><p class="small muted" style="margin:4px 0 0">Тебя убрали из команды, или ссылка-приглашение устарела (админ её обновил). Попроси у админа новую ссылку и вставь сюда.</p>
+  <div class="card"><b>Нет доступа к команде</b><p class="small muted" style="margin:4px 0 0">Тебя убрали из команды, или ссылка-приглашение устарела (админ её обновил). Попроси у админа новую ссылку и вставь сюда. Если ты сам админ и случайно вышел — открой ссылку-приглашение, которую ты отправлял в WhatsApp/Telegram: права админа вернутся.</p>
   <input type="text" id="obInvite" style="margin-top:10px" placeholder="https://…?team=…&k=…">
   <button class="btn block" style="margin-top:10px" onclick="deniedJoin()">Войти по новой ссылке</button></div>
   <div class="card"><b>Или создать свою команду</b><p class="small muted" style="margin:2px 0 8px">Ты станешь в ней админом.</p>
@@ -493,7 +494,8 @@ function renderTeam(){
   if(ms.length) h+=`<p class="small muted" style="margin:8px 0 0">Один человек может быть в списке дважды, если открыл и в браузере, и с экрана «Домой».</p>`;
   h+=`</div>`;
   if(!isStandalone()) h+=installHint();
-  h+=`<button class="btn danger block" onclick="askLeave()">Выйти из команды на этом телефоне</button>`;
+  h+=`<p class="small muted" style="text-align:center;margin:18px 0 8px">Чтобы закрыть приложение, просто смахни его вверх — из команды ты не выйдешь.</p>
+  <button class="btn danger block" onclick="askLeave()">Покинуть команду</button>`;
   return h;
 }
 
@@ -538,7 +540,10 @@ function shareInvite(){ shareText('Присоединяйся к нашей ко
 let addState={src:null,name:'',qty:1};
 function openAdd(){ addState={src:null,name:'',qty:1}; sheet={kind:'add'}; renderSheet(); }
 function askDelete(){ sheet={kind:'del'}; renderSheet(); }
-function askLeave(){ sheet={kind:'leave'}; renderSheet(); }
+function askLeave(){
+  const others=(S.members||[]).filter(m=>!m.me).length; const adm=(S.teamInfo&&S.teamInfo.admins)||[];
+  if(isAdmin() && adm.length<=1 && others>0){ toast('Ты единственный админ. Сначала сделай админом кого-то ещё'); return; }
+  sheet={kind:'leave', alone: others===0}; renderSheet(); }
 function closeSheet(){ sheet=null; const el=$('#sheet'); if(el) el.remove(); }
 function renderSheet(){
   let el=$('#sheet'); if(!el){ el=document.createElement('div'); el.id='sheet'; el.className='sheetbg'; el.addEventListener('click',e=>{ if(e.target===el) closeSheet(); }); document.body.appendChild(el); }
@@ -557,7 +562,7 @@ function renderSheet(){
   } else if(sheet.kind==='rotate'){
     h+=`<h2>Сделать новую ссылку?</h2><p class="muted">Старая ссылка-приглашение перестанет работать. Все, кто уже в команде, останутся.</p><div class="row"><button class="btn ghost grow" onclick="closeSheet()">Отмена</button><button class="btn grow" onclick="doRotate()">Обновить</button></div>`;
   } else if(sheet.kind==='leave'){
-    h+=`<h2>Выйти из команды?</h2><p class="muted">На этом телефоне пропадёт доступ. Данные команды останутся у остальных. Вернуться можно по ссылке-приглашению.</p><div class="row"><button class="btn ghost grow" onclick="closeSheet()">Отмена</button><button class="btn grow" style="background:var(--bad)" onclick="doLeave()">Выйти</button></div>`;
+    h+=`<h2>Покинуть команду?</h2><p class="muted">Это не закрытие приложения: на этом телефоне пропадёт доступ к составу и спискам. Вернуться можно только по ссылке-приглашению.${sheet.alone?' <b>Ты в команде один — после выхода войти обратно можно будет только по ссылке, которую ты кому-то отправлял.</b>':''}</p><div class="row"><button class="btn ghost grow" onclick="closeSheet()">Отмена</button><button class="btn grow" style="background:var(--bad)" onclick="doLeave()">Выйти</button></div>`;
   } else if(sheet.kind==='copy'){
     h+=`<h2>Скопируй текст</h2><textarea class="copybox" readonly>${esc(sheet.text)}</textarea><button class="btn block" style="margin-top:10px" onclick="closeSheet()">Готово</button>`;
   }
@@ -589,7 +594,11 @@ window.startApp = function(backend){
   const fromUrl = readTeamFromUrl();
   const saved = LS.get('rider-team', null);
   S.mode='ready';
-  if(fromUrl && (fromUrl.team!==saved || (fromUrl.key && fromUrl.key!==LS.get('rider-key-'+fromUrl.team,null)))){
+  // В установленном приложении адрес запуска «зашит» при установке и может быть устаревшим,
+  // поэтому там сохранённая команда важнее адреса. В браузере ссылка-приглашение важнее.
+  const useUrl = fromUrl && !(isStandalone() && saved) &&
+    (fromUrl.team!==saved || (fromUrl.key && fromUrl.key!==LS.get('rider-key-'+fromUrl.team,null)));
+  if(useUrl){
     if(S.name) setTeam(fromUrl.team, fromUrl.key); else S.pendingTeam=fromUrl;
   } else if(saved){ S.team=saved; S.teamKey=LS.get('rider-key-'+saved,null); connect(); }
   route();

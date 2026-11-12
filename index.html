@@ -158,7 +158,13 @@ async function firebaseBackend(){
         await b.commit();
         return { uid, key: k, created: !!creating };
       }
-      await F.setDoc(meRef, { name: nm, lastSeen: now, joinedAt: now, key });
+      try { await F.setDoc(meRef, { name: nm, lastSeen: now, joinedAt: now, key }); }
+      catch (e) {
+        let alt = null; try { alt = JSON.parse(localStorage.getItem('rider-key-' + team) || 'null'); } catch (x) {}
+        if (!alt || alt === key) throw e;
+        await F.setDoc(meRef, { name: nm, lastSeen: now, joinedAt: now, key: alt });
+        return { uid, key: alt };
+      }
       return { uid };
     },
     async touchMember(team, name) { const u = await authed;
