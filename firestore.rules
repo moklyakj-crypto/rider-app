@@ -1,10 +1,40 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Доступ только из приложения (анонимный вход) и только к своей команде.
-    // Код команды — длинный случайный, его знают только те, кому прислали ссылку.
-    match /teams/{team}/{document=**} {
-      allow read, write: if request.auth != null && team.size() >= 16;
+    // Только из приложения (анонимный вход) и только к своей команде.
+    // Код команды длинный и случайный, его знают только те, кому прислали ссылку.
+    function teamOk(team) {
+      return request.auth != null && team.matches('^[a-z0-9]{16,40}$');
     }
+    function strMax(d, key, n) {
+      return !(key in d) || (d[key] is string && d[key].size() <= n);
+    }
+    function mapMax(d, key, n) {
+      return !(key in d) || (d[key] is map && d[key].size() <= n);
+    }
+
+    match /teams/{team}/services/{sid} {
+      allow read, delete: if teamOk(team);
+      allow create, update: if teamOk(team)
+        && sid.matches('^s[a-z0-9]{6,30}$')
+        && request.resource.data.keys().hasOnly(['date', 'title', 'notes', 'lineup', 'mon', 'packed', 'updatedAt', 'updatedByName'])
+        && strMax(request.resource.data, 'date', 10)
+        && strMax(request.resource.data, 'title', 120)
+        && strMax(request.resource.data, 'notes', 2000)
+        && strMax(request.resource.data, 'updatedByName', 60)
+        && (!('lineup' in request.resource.data) || (request.resource.data.lineup is list && request.resource.data.lineup.size() <= 80))
+        && mapMax(request.resource.data, 'mon', 4)
+        && mapMax(request.resource.data, 'packed', 40)
+        && (!('updatedAt' in request.resource.data) || request.resource.data.updatedAt is number);
+    }
+
+    match /teams/{team}/meta/inventory {
+      allow read: if teamOk(team);
+      allow create, update: if teamOk(team)
+        && request.resource.data.keys().hasOnly(['stock', 'spare'])
+        && mapMax(request.resource.data, 'stock', 40)
+        && mapMax(request.resource.data, 'spare', 4);
+    }
+    // Всё остальное закрыто.
   }
 }

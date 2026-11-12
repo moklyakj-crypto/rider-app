@@ -3,7 +3,6 @@
   "short_name": "Райдер",
   "description": "Состав прославления → сколько микрофонов, проводов, DI и стоек брать",
   "lang": "ru",
-  "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "background_color": "#f5f4f0",

@@ -95,9 +95,32 @@ function localBackend(){
     subscribe(t,onSvc,onInv){ svcCb=onSvc; invCb=onInv; const o=load(t);
       onSvc(Object.entries(o.services||{}).map(([id,v])=>Object.assign({id},v))); onInv(o.inv); return ()=>{}; },
     saveService(t,svc){ const o=load(t); const b=Object.assign({},svc); delete b.id; o.services[svc.id]=b; LS.set(key(t),o); },
+    patchService(t,id,p){ const o=load(t); const d=o.services[id]; if(!d) return; for(const k in p){ const parts=k.split('.'); if(parts.length===2){ d[parts[0]]=d[parts[0]]||{}; if(p[k]===null) delete d[parts[0]][parts[1]]; else d[parts[0]][parts[1]]=p[k]; } else d[k]=p[k]; } LS.set(key(t),o); },
     deleteService(t,id){ const o=load(t); delete o.services[id]; LS.set(key(t),o); },
     saveInv(t,inv){ const o=load(t); o.inv=inv; LS.set(key(t),o); }
   };
+}
+
+/* ---- Проверка данных из базы: всё, что пришло извне, считаем недоверенным ---- */
+const ID_RE=/^s[a-z0-9]{6,30}$/;
+const str=(v,n)=> typeof v==='string' ? v.slice(0,n) : '';
+const int=(v,lo,hi)=>{ v=parseInt(v,10); return isNaN(v)?lo:Math.min(hi,Math.max(lo,v)); };
+function cleanSvc(id, d){
+  if(!ID_RE.test(id) || !d || typeof d!=='object') return null;
+  const lineup=(Array.isArray(d.lineup)?d.lineup:[]).slice(0,80)
+    .filter(x=>x && typeof x==='object' && ID_RE.test(x.id) && Object.prototype.hasOwnProperty.call(SOURCES, x.src))
+    .map(x=>({id:x.id, src:x.src, name:str(x.name,40), qty:int(x.qty,1,20)}));
+  const packed={}; if(d.packed && typeof d.packed==='object') for(const k in d.packed) if(EQ_NAME[k] && d.packed[k]===true) packed[k]=true;
+  const mon={}; for(const k in MON) mon[k]=int(d.mon&&d.mon[k],0,30);
+  const date=/^\d{4}-\d{2}-\d{2}$/.test(d.date)?d.date:'';
+  return {id, date, title:str(d.title,120), notes:str(d.notes,2000), lineup, mon, packed,
+    updatedAt: typeof d.updatedAt==='number'?d.updatedAt:0, updatedByName:str(d.updatedByName,60)};
+}
+function cleanInv(d){
+  const stock={}, spare={xlr:2,jack:1};
+  if(d && d.stock && typeof d.stock==='object') for(const k in d.stock) if(EQ_NAME[k]) stock[k]=int(d.stock[k],0,999);
+  if(d && d.spare && typeof d.spare==='object') for(const k of ['xlr','jack']) if(d.spare[k]!=null) spare[k]=int(d.spare[k],0,50);
+  return {stock, spare};
 }
 
 let unsub=null;
@@ -107,35 +130,45 @@ function connect(){
   const be=S.backend;
   const t=setTimeout(()=>{ if(!S.loaded){ S.stale=true; render(); } },10000);
   unsub = be.subscribe(S.team, list=>{
-    S.services=list; sortServices(); S.loaded=true; S.stale=false; clearTimeout(t); softRender();
+    S.services=list.map(x=>cleanSvc(x.id,x)).filter(Boolean); sortServices(); S.loaded=true; S.stale=false; clearTimeout(t); softRender();
   }, inv=>{
-    if(inv) S.inv={stock:inv.stock||{}, spare:inv.spare||{xlr:2,jack:1}}; softRender();
+    if(inv) S.inv=cleanInv(inv); softRender();
   }, err=>{ S.err=err; S.loaded=true; clearTimeout(t); render(); });
 }
 
-function saveService(svc){
-  svc.updatedAt=Date.now(); svc.updatedByName=S.name||'';
+// patch — только изменённые поля ('packed.xlr': true / null = удалить). Без patch — документ целиком (новый).
+function saveService(svc, patch){
+  svc.updatedAt=Date.now(); svc.updatedByName=(S.name||'').slice(0,60);
   const i=S.services.findIndex(s=>s.id===svc.id); if(i>=0) S.services[i]=svc; else S.services.push(svc);
   sortServices();
-  Promise.resolve(S.backend.saveService(S.team, JSON.parse(JSON.stringify(svc)))).catch(onWriteErr);
+  const p = patch ? Object.assign({}, patch, {updatedAt:svc.updatedAt, updatedByName:svc.updatedByName}) : null;
+  Promise.resolve(p && S.backend.patchService ? S.backend.patchService(S.team, svc.id, JSON.parse(JSON.stringify(p)))
+    : S.backend.saveService(S.team, JSON.parse(JSON.stringify(svc)))).catch(onWriteErr);
 }
 function deleteService(id){ S.services=S.services.filter(s=>s.id!==id); Promise.resolve(S.backend.deleteService(S.team, id)).catch(onWriteErr); }
 function saveInv(){ Promise.resolve(S.backend.saveInv(S.team, JSON.parse(JSON.stringify(S.inv)))).catch(onWriteErr); }
-function onWriteErr(e){ console.error(e); toast('Не сохранилось: '+((e&&e.code)||'ошибка связи')); }
+function onWriteErr(e){ console.error(e); const c=e&&e.code;
+  toast(c==='permission-denied'?'Нет доступа к этой команде':c==='not-found'?'Это служение уже удалили':'Не сохранилось, проверь интернет'); }
 function sortServices(){ S.services.sort((a,b)=>(b.date||'').localeCompare(a.date||'') || (b.updatedAt||0)-(a.updatedAt||0)); }
 
 /* ===================== Команда (приглашение по ссылке) ===================== */
 function inviteLink(){ const u=new URL(location.href); u.hash=''; u.search='?team='+S.team; return u.toString(); }
 function readTeamFromUrl(){
   const u=new URL(location.href); const t=(u.searchParams.get('team')||'').trim().toLowerCase();
-  if(t){ u.searchParams.delete('team'); history.replaceState(null,'',u.pathname+(u.search||'')+u.hash); }
   return /^[a-z0-9]{16,40}$/.test(t)?t:null;
+}
+// Код команды держим в адресной строке: при «На экран „Домой“» он попадёт в ярлык,
+// и установленное приложение сразу откроется в нужной команде.
+function syncUrlTeam(){
+  const u=new URL(location.href);
+  if(S.team) u.searchParams.set('team',S.team); else u.searchParams.delete('team');
+  const next=u.pathname+(u.search||'')+u.hash; if(next!==location.pathname+location.search+location.hash) history.replaceState(null,'',next);
 }
 function parseTeamInput(v){
   v=(v||'').trim(); try{ const u=new URL(v); v=u.searchParams.get('team')||''; }catch(e){}
   v=v.toLowerCase(); return /^[a-z0-9]{16,40}$/.test(v)?v:null;
 }
-function setTeam(t){ S.team=t; LS.set('rider-team',t); connect(); go(''); }
+function setTeam(t){ S.team=t; LS.set('rider-team',t); syncUrlTeam(); connect(); go(''); }
 
 /* ===================== UI ===================== */
 let view={name:'list', id:null, tab:'lineup'};
@@ -188,7 +221,7 @@ function renderOnboarding(){
   const pending=S.pendingTeam;
   let h=`<header class="top"><h1>Райдер служения</h1></header>
   <div class="card"><p style="margin-top:0">Состав прославления → сколько микрофонов, проводов, DI-боксов и стоек брать. Вся команда видит одно и то же.</p>
-  <label class="f">Как тебя зовут</label><input type="text" id="obName" value="${esc(S.name)}" placeholder="Например: Иосиф"></div>`;
+  <label class="f">Как тебя зовут</label><input type="text" id="obName" maxlength="40" value="${esc(S.name)}" placeholder="Например: Иосиф"></div>`;
   if(pending){
     h+=`<div class="card"><b>Тебя пригласили в команду</b><p class="small muted">Введи имя и нажми «Войти».</p>
     <button class="btn block" onclick="obJoin('${pending}')">Войти в команду</button></div>`;
@@ -205,11 +238,11 @@ function renderOnboarding(){
 }
 function installHint(){
   const ios=/iphone|ipad|ipod/i.test(navigator.userAgent);
-  return `<div class="card small"><b>Установить на экран «Домой»</b><p class="muted" style="margin:4px 0 0">${ios
+  return `<div class="card small"><b>Установить на экран «Домой»</b><p class="muted" style="margin:4px 0 0">${S.team?'':'Сначала войди в команду, потом устанавливай — так приложение запомнит её. '}${ios
     ? 'Открой эту страницу в Safari → кнопка «Поделиться» (квадрат со стрелкой) → «На экран „Домой“».'
     : 'В Chrome: меню ⋮ → «Добавить на главный экран» / «Установить приложение».'}</p></div>`;
 }
-function readObName(){ const v=(($('#obName')||{}).value||'').trim(); if(!v){ toast('Впиши имя'); return null; } S.name=v; LS.set('rider-name',v); return v; }
+function readObName(){ const v=(($('#obName')||{}).value||'').trim().slice(0,40); if(!v){ toast('Впиши имя'); return null; } S.name=v; LS.set('rider-name',v); return v; }
 function obJoin(t){ if(!readObName()) return; t=t||parseTeamInput(($('#obInvite')||{}).value); if(!t){ toast('Не похоже на ссылку-приглашение'); return; } S.pendingTeam=null; setTeam(t); }
 function obCreate(){ if(!readObName()) return; setTeam(randId(20)); setTimeout(()=>{ go('team'); toast('Команда создана — отправь ссылку остальным'); },50); }
 function obSaveName(){ if(!readObName()) return; render(); }
@@ -264,8 +297,8 @@ function renderSvc(){
 function tabLineup(s,c){
   let h=`<div class="card"><div class="grid2">
     <div><label class="f">Дата</label><input type="date" value="${esc(s.date)}" onchange="setField('date',this.value)"></div>
-    <div><label class="f">Название</label><input type="text" data-keep="1" value="${esc(s.title)}" oninput="setFieldDeb('title',this.value)"></div></div>
-    <div style="margin-top:10px"><label class="f">Заметки для звукаря</label><textarea data-keep="1" placeholder="Например: Аня поёт с бубном, нужен отдельный монитор" oninput="setFieldDeb('notes',this.value)">${esc(s.notes)}</textarea></div>
+    <div><label class="f">Название</label><input type="text" maxlength="120" data-keep="1" value="${esc(s.title)}" oninput="setFieldDeb('title',this.value)"></div></div>
+    <div style="margin-top:10px"><label class="f">Заметки для звукаря</label><textarea maxlength="2000" data-keep="1" placeholder="Например: Аня поёт с бубном, нужен отдельный монитор" oninput="setFieldDeb('notes',this.value)">${esc(s.notes)}</textarea></div>
     ${s.updatedByName?`<div class="small muted" style="margin-top:8px">Последнее изменение: ${esc(s.updatedByName)}${s.updatedAt?', '+new Date(s.updatedAt).toLocaleString('ru-RU',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}):''}</div>`:''}
   </div>`;
   h+=`<div class="card"><b>Кто играет и поёт</b>`;
@@ -335,7 +368,7 @@ function renderTeam(){
     <input type="text" readonly value="${esc(inviteLink())}" onclick="this.select()">
     <button class="btn block" style="margin-top:10px" onclick="shareInvite()">Отправить приглашение</button></div>
     <div class="card"><label class="f">Твоё имя (видно в «Последнее изменение»)</label>
-    <input type="text" data-keep="1" value="${esc(S.name)}" oninput="setName(this.value)"></div>`;
+    <input type="text" maxlength="40" data-keep="1" value="${esc(S.name)}" oninput="setName(this.value)"></div>`;
   if(!isStandalone()) h+=installHint();
   h+=`<button class="btn danger block" onclick="askLeave()">Выйти из команды на этом телефоне</button>`;
   return h;
@@ -343,18 +376,18 @@ function renderTeam(){
 
 /* ===== действия ===== */
 let debT={};
-function setField(f,v){ const s=curSvc(); if(!s||s[f]===v) return; s[f]=v; saveService(s); render(); }
-function setFieldDeb(f,v){ const s=curSvc(); if(!s) return; s[f]=v; clearTimeout(debT[f]); debT[f]=setTimeout(()=>{ const cur=curSvc(); if(cur){ cur[f]=v; saveService(cur);} },700); }
-function qty(id,d){ const s=curSvc(); const it=(s.lineup||[]).find(x=>x.id===id); if(!it) return; const n=Math.max(1,(it.qty||1)+d); if(n===it.qty) return; it.qty=n; saveService(s); render(); }
-function removeItem(id){ const s=curSvc(); s.lineup=(s.lineup||[]).filter(x=>x.id!==id); saveService(s); render(); }
-function monQty(m,d){ const s=curSvc(); s.mon=s.mon||{}; const n=Math.max(0,(s.mon[m]|0)+d); if(n===(s.mon[m]|0)) return; s.mon[m]=n; saveService(s); render(); }
-function togglePack(k){ const s=curSvc(); s.packed=s.packed||{}; if(s.packed[k]) delete s.packed[k]; else s.packed[k]=true; saveService(s); render(); }
-function resetPacked(){ const s=curSvc(); s.packed={}; saveService(s); render(); }
+function setField(f,v){ const s=curSvc(); if(!s||s[f]===v) return; s[f]=v; saveService(s,{[f]:v}); render(); }
+function setFieldDeb(f,v){ const s=curSvc(); if(!s) return; s[f]=v; clearTimeout(debT[f]); debT[f]=setTimeout(()=>{ const cur=curSvc(); if(cur){ cur[f]=v; saveService(cur,{[f]:v});} },700); }
+function qty(id,d){ const s=curSvc(); const it=(s.lineup||[]).find(x=>x.id===id); if(!it) return; const n=Math.max(1,(it.qty||1)+d); if(n===it.qty) return; it.qty=n; saveService(s,{lineup:s.lineup}); render(); }
+function removeItem(id){ const s=curSvc(); s.lineup=(s.lineup||[]).filter(x=>x.id!==id); saveService(s,{lineup:s.lineup}); render(); }
+function monQty(m,d){ const s=curSvc(); s.mon=s.mon||{}; const n=Math.max(0,(s.mon[m]|0)+d); if(n===(s.mon[m]|0)) return; s.mon[m]=n; saveService(s,{['mon.'+m]:n}); render(); }
+function togglePack(k){ const s=curSvc(); s.packed=s.packed||{}; const on=!s.packed[k]; if(on) s.packed[k]=true; else delete s.packed[k]; saveService(s,{['packed.'+k]: on?true:null}); render(); }
+function resetPacked(){ const s=curSvc(); s.packed={}; saveService(s,{packed:{}}); render(); }
 let invT=null;
 function setStock(k,v){ if(v===''||v==null) delete S.inv.stock[k]; else S.inv.stock[k]=Math.max(0,parseInt(v,10)||0); clearTimeout(invT); invT=setTimeout(saveInv,700); }
 function setSpare(k,v){ S.inv.spare[k]=Math.max(0,parseInt(v,10)||0); clearTimeout(invT); invT=setTimeout(saveInv,700); }
 let nameT=null;
-function setName(v){ clearTimeout(nameT); nameT=setTimeout(()=>{ v=v.trim(); if(v){ S.name=v; LS.set('rider-name',v); } },500); }
+function setName(v){ clearTimeout(nameT); nameT=setTimeout(()=>{ v=v.trim().slice(0,40); if(v){ S.name=v; LS.set('rider-name',v); } },500); }
 
 function listText(){
   const s=curSvc(); const c=calc(s,S.inv); const d=fmtDate(s.date);
@@ -390,7 +423,7 @@ function renderSheet(){
   if(sheet.kind==='add'){
     h+=`<h2>Добавить в состав</h2><label class="f">Что</label><div class="srcs">`;
     for(const k in SOURCES){ const s=SOURCES[k]; h+=`<button class="src ${addState.src===k?'on':''}" onclick="pickSrc('${k}')"><b>${esc(s.n)}</b><span>${esc(s.d)}</span></button>`; }
-    h+=`</div><div class="grid2"><div><label class="f">Кто (имя)</label><input type="text" id="addName" value="${esc(addState.name)}" placeholder="Аня" oninput="addState.name=this.value"></div>
+    h+=`</div><div class="grid2"><div><label class="f">Кто (имя)</label><input type="text" id="addName" maxlength="40" value="${esc(addState.name)}" placeholder="Аня" oninput="addState.name=this.value"></div>
       <div><label class="f">Сколько</label><div class="step" style="width:max-content"><button onclick="addQty(-1)">−</button><span id="addQ">${addState.qty}</span><button onclick="addQty(1)">+</button></div></div></div>
       <div class="row" style="margin-top:16px"><button class="btn ghost grow" onclick="closeSheet()">Отмена</button><button class="btn grow" id="addOk" ${addState.src?'':'disabled'} onclick="confirmAdd()">Добавить</button></div>
       <p class="small muted" style="margin-top:10px">«Сколько» — например, 3 бэк-вокала без имён. Если знаешь имена, лучше добавлять по одному.</p>`;
@@ -409,11 +442,11 @@ function addQty(d){ addState.qty=Math.max(1,addState.qty+d); const q=$('#addQ');
 function confirmAdd(){
   const s=curSvc(); if(!s||!addState.src) return;
   addState.name=($('#addName')||{}).value||addState.name;
-  s.lineup=s.lineup||[]; s.lineup.push({id:uid(), src:addState.src, name:addState.name.trim(), qty:addState.qty});
-  saveService(s); closeSheet(); render();
+  s.lineup=s.lineup||[]; s.lineup.push({id:uid(), src:addState.src, name:addState.name.trim().slice(0,40), qty:addState.qty});
+  saveService(s,{lineup:s.lineup}); closeSheet(); render();
 }
 function doDelete(){ const id=view.id; closeSheet(); deleteService(id); go(''); }
-function doLeave(){ closeSheet(); if(unsub){ try{unsub();}catch(e){} unsub=null; } LS.del('rider-team'); S.team=null; S.loaded=false; go(''); }
+function doLeave(){ closeSheet(); if(unsub){ try{unsub();}catch(e){} unsub=null; } LS.del('rider-team'); S.team=null; S.loaded=false; syncUrlTeam(); go(''); }
 
 /* ===================== Запуск ===================== */
 window.startApp = function(backend){
@@ -424,7 +457,7 @@ window.startApp = function(backend){
   if(fromUrl && fromUrl!==saved){ if(S.name){ S.team=fromUrl; LS.set('rider-team',fromUrl); } else S.pendingTeam=fromUrl; }
   else S.team = saved;
   S.mode='ready';
-  if(S.team) connect();
+  if(S.team){ syncUrlTeam(); connect(); }
   route();
 };
 window.localBackend = localBackend;

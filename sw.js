@@ -1,5 +1,5 @@
 // Офлайн-кэш: сначала сеть (чтобы обновления приходили сразу), без сети — из кэша.
-const CACHE = 'rider-v2';
+const CACHE = 'rider-v3';
 const SHELL = ['./', './index.html', './config.js', './app.js', './firebase.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 
@@ -16,7 +16,7 @@ self.addEventListener('fetch', e => {
   const url = new URL(req.url);
   // Запросы к базе Firebase не трогаем — у неё свой офлайн-режим.
   if (url.hostname.endsWith('googleapis.com') || url.hostname.endsWith('firebaseio.com')) return;
-  const cacheable = url.origin === self.location.origin || url.hostname === 'www.gstatic.com';
+  const cacheable = url.origin === self.location.origin;
   if (!cacheable) return;
   e.respondWith(
     fetch(req).then(res => {
